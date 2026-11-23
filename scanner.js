@@ -11,115 +11,38 @@ function validQuad(points) {
   return points.every((point, i) => cross(point, points[(i + 1) % 4], points[(i + 2) % 4]) > .003);
 }
 
-function hull(points) {
-  points.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-  const half = (sequence) => {
-    const result = [];
-    for (const point of sequence) {
-      while (result.length > 1 && cross(result.at(-2), result.at(-1), point) <= 0) result.pop();
-      result.push(point);
-    }
-    return result.slice(0, -1);
-  };
-  return half(points).concat(half(points.reverse()));
-}
-
 function findPaper(rgba, width, height) {
   if (width < 12 || height < 12) return null;
-  const length = width * height;
-  const gray = new Uint8Array(length);
-  const histogram = new Uint32Array(256);
-  let sum = 0;
-  for (let i = 0; i < length; i++) {
-    const value = (77 * rgba[i * 4] + 150 * rgba[i * 4 + 1] + 29 * rgba[i * 4 + 2]) >> 8;
-    gray[i] = value;
-    histogram[value]++;
-    sum += value;
+  const gray = new Uint8Array(width * height);
+  for (let i = 0; i < gray.length; i++) {
+    gray[i] = (77 * rgba[i * 4] + 150 * rgba[i * 4 + 1] + 29 * rgba[i * 4 + 2]) >> 8;
   }
 
-  // Separate light paper from its background with Otsu's between-class variance.
-  let lowCount = 0, lowSum = 0, best = 0, threshold = 0;
-  for (let value = 0; value < 255; value++) {
-    lowCount += histogram[value];
-    lowSum += histogram[value] * value;
-    if (!lowCount || lowCount === length) continue;
-    const highCount = length - lowCount;
-    const difference = (sum - lowSum) / highCount - lowSum / lowCount;
-    const score = lowCount * highCount * difference ** 2;
-    if (score > best) {
-      best = score;
-      threshold = value;
-    }
-  }
-  const above = (value) => value > Math.max(85, threshold);
-  const mask = new Uint8Array(length);
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const i = y * width + x;
-      // A majority filter bridges small lettering and suppresses stray bright pixels.
-      const count = Number(above(gray[i])) + Number(above(gray[i - 1])) +
-        Number(above(gray[i + 1])) + Number(above(gray[i - width])) + Number(above(gray[i + width]));
-      mask[i] = count >= 3;
-    }
-  }
+  const top = fitPaperSide(gray, width, height, false, false);
+  const right = fitPaperSide(gray, width, height, true, true);
+  const bottom = fitPaperSide(gray, width, height, false, true);
+  const left = fitPaperSide(gray, width, height, true, false);
+  if ([top, right, bottom, left].filter(Boolean).length < 2) return null;
 
-  const queue = new Int32Array(length);
-  let selected = null, largest = 0;
-  for (let start = width + 1; start < length - width - 1; start++) {
-    if (!mask[start]) continue;
-    mask[start] = 0;
-    queue[0] = start;
-    let tail = 1, border = 0;
-    const left = new Int32Array(height).fill(width);
-    const right = new Int32Array(height).fill(-1);
-    for (let head = 0; head < tail; head++) {
-      const index = queue[head];
-      const y = Math.floor(index / width), x = index % width;
-      left[y] = Math.min(left[y], x);
-      right[y] = Math.max(right[y], x);
-      if (x === 1 || y === 1 || x === width - 2 || y === height - 2) border++;
-      for (const nearby of [index - 1, index + 1, index - width, index + width]) {
-        if (!mask[nearby]) continue;
-        mask[nearby] = 0;
-        queue[tail++] = nearby;
-      }
-    }
-    if (tail < length * .11 || border > (width + height) * .38 || tail <= largest) continue;
-    const edges = [];
-    for (let y = 1; y < height - 1; y++) {
-      if (right[y] < 0) continue;
-      edges.push([left[y], y], [right[y], y]);
-    }
-    const corners = hull(edges);
-    // Reduce the convex outline to four vertices while keeping the strongest corners.
-    while (corners.length > 4) {
-      let remove = 0, least = Infinity;
-      for (let i = 0; i < corners.length; i++) {
-        const area = cross(corners[(i + corners.length - 1) % corners.length], corners[i], corners[(i + 1) % corners.length]);
-        if (area < least) {
-          least = area;
-          remove = i;
-        }
-      }
-      corners.splice(remove, 1);
-    }
-    if (corners.length !== 4) continue;
-    const normalized = corners.map(([x, y]) => [x / (width - 1), y / (height - 1)]);
-    const top = normalized.reduce((bestIndex, p, i) => p[0] + p[1] < normalized[bestIndex][0] + normalized[bestIndex][1] ? i : bestIndex, 0);
-    const ordered = normalized.slice(top).concat(normalized.slice(0, top));
-    if (!validQuad(ordered)) continue;
-    const area = (cross(ordered[0], ordered[1], ordered[2]) + cross(ordered[0], ordered[2], ordered[3])) / 2;
-    if (area < .14 || area > .97 || tail / (area * length) < .57) continue;
-    selected = ordered;
-    largest = tail;
-  }
-  return refinePaperEdges(gray, width, height, selected);
+  // An unconfirmed edge stays at the frame. Printed lines and shadows can
+  // split a bright paper region, so a color mask alone must never cut a side.
+  const intersection = ([v, vy], [h, hx]) => {
+    const y = (h + hx * v) / (1 - hx * vy);
+    return [clamp(v + vy * y, 0, 1), clamp(y, 0, 1)];
+  };
+  const corners = [intersection(left || [0, 0], top || [0, 0]),
+    intersection(right || [1, 0], top || [0, 0]),
+    intersection(right || [1, 0], bottom || [1, 0]),
+    intersection(left || [0, 0], bottom || [1, 0])];
+  const area = (cross(corners[0], corners[1], corners[2]) + cross(corners[0], corners[2], corners[3])) / 2;
+  return area > .18 && area < .985 && validQuad(corners) ? corners : null;
 }
 
 function fitPaperSide(gray, width, height, vertical, reverse) {
   const across = vertical ? width : height;
   const along = vertical ? height : width;
   const inset = Math.max(2, Math.round(across * .009));
+  const band = Math.max(3, Math.round(across * .026));
   const readings = [];
   const get = (x, y) => {
     const normal = reverse ? across - 1 - x : x;
@@ -137,7 +60,14 @@ function fitPaperSide(gray, width, height, vertical, reverse) {
       const inner = get(x + inset, y) + get(x + 2 * inset, y) + get(x + 2 * inset, y + 1);
       const contrast = (inner - outer) / 3;
       if (contrast < 15 || inner < 345) continue;
-      candidates.push({pos: x / (across - 1), weight: Math.min(contrast, 70)});
+      // Ink strokes brighten again beyond the line. Compare wider inside
+      // and outside strips before a scan line can support this boundary.
+      const inside = (get(x + band, y) + get(x + band * 2, y) + get(x + band * 3, y)) / 3;
+      const background = Math.max(get(Math.max(0, x - band), y),
+        get(Math.max(0, x - band * 2), y), get(Math.max(0, x - band * 3), y));
+      const wideContrast = inside - background;
+      if (inside < 108 || wideContrast < 12 || wideContrast < contrast * .44) continue;
+      candidates.push({pos: x / (across - 1), weight: Math.min(contrast, wideContrast, 70)});
     }
     candidates.sort((a, b) => b.weight - a.weight);
     const peaks = [];
@@ -169,7 +99,7 @@ function fitPaperSide(gray, width, height, vertical, reverse) {
             score += 1 + match.weight / 80 - Math.abs(match.pos - estimated) / tolerance * .35;
             support.push([row.run, match.pos]);
           }
-          if (support.length < 12 || support.at(-1)[0] - support[0][0] < .4) continue;
+          if (support.length < 14 || support.at(-1)[0] - support[0][0] < .46) continue;
           // When two lines have similar support, prefer the outer paper boundary.
           score -= 12 * (offset + slope * .5);
           if (score <= bestScore) continue;
@@ -189,46 +119,10 @@ function fitPaperSide(gray, width, height, vertical, reverse) {
   }
   const count = best.length;
   const slope = (count * sumXY - sumX * sumY) / (count * sumXX - sumX * sumX);
-  const offset = (sumY - slope * sumX) / count;
+  // Leave a narrow safety margin for uneven or curled sheet edges.
+  const offset = (sumY - slope * sumX) / count - .012;
   return reverse ? [1 - offset, -slope] : [offset, slope];
 }
-
-function refinePaperEdges(gray, width, height, fallback) {
-  const frame = fallback || fullFrame();
-  const sides = [fitPaperSide(gray, width, height, false, false),
-    fitPaperSide(gray, width, height, true, true),
-    fitPaperSide(gray, width, height, false, true),
-    fitPaperSide(gray, width, height, true, false)];
-  if (!fallback && sides.filter(Boolean).length < 3) return null;
-  for (let i = 0; i < 4; i++) {
-    if (!sides[i] || !fallback) continue;
-    const xAxis = i % 2 === 0;
-    const axis = xAxis ? 0 : 1, normal = 1 - axis;
-    const a = frame[i], b = frame[(i + 1) % 4];
-    // Use the mask where it already reaches a realistic edge. A conflicting
-    // interior line can be a crease, print or the boundary of a hard shadow.
-    const displacement = ([x,y]) => Math.abs(sides[i][0] + sides[i][1] * (axis === 0 ? x : y) - (normal === 0 ? x : y));
-    if (displacement(a) > .095 || displacement(b) > .095) sides[i] = null;
-  }
-  const edge = (i) => {
-    if (sides[i]) return sides[i];
-    const axis = i % 2, normal = 1 - axis;
-    const a = frame[i], b = frame[(i + 1) % 4];
-    const slope = (b[normal] - a[normal]) / (b[axis] - a[axis]);
-    return [a[normal] - slope * a[axis], slope];
-  };
-  const intersection = ([v, vy], [h, hx]) => {
-    const y = (h + hx * v) / (1 - hx * vy);
-    return [clamp(v + vy * y, 0, 1), clamp(y, 0, 1)];
-  };
-  const [top, right, bottom, left] = [0, 1, 2, 3].map(edge);
-  const corners = [intersection(left, top), intersection(right, top),
-    intersection(right, bottom), intersection(left, bottom)];
-  const area = (cross(corners[0], corners[1], corners[2]) + cross(corners[0], corners[2], corners[3])) / 2;
-  return area > .16 && area < .98 && validQuad(corners) ? corners : fallback;
-}
-
-
 
 function makeCanvas(width, height) {
   const canvas = document.createElement("canvas");
@@ -610,7 +504,7 @@ function startScanner() {
     $("camera-status").textContent = message;
     $("camera-status").hidden = !message;
     $("native-camera").hidden = !fallback;
-    video.hidden = $("snap").hidden = fallback;
+    video.hidden = $("snap").hidden = $("camera-framing").hidden = fallback;
   }
 
   function releaseStream() {
@@ -648,7 +542,7 @@ function startScanner() {
     cameraStatus("بنفتح الكاميرا…");
     try {
       const camera = await navigator.mediaDevices?.getUserMedia({
-        audio: false, video: {facingMode: {ideal: "environment"}, width: {ideal: 1920}, height: {ideal: 1920}}
+        audio: false, video: {facingMode: {ideal: "environment"}, width: {ideal: 1920}}
       });
       if (!camera) throw new Error("Camera unavailable");
       if (opening !== request) {

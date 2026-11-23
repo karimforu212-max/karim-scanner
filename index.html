@@ -6,8 +6,8 @@
 <meta name="theme-color" content="#101b2e">
 <meta name="description" content="قص المستندات وحوّل الصور إلى PDF على الآيفون والكمبيوتر.">
 <title>Karim Scanner | كريم سكانر</title>
-<link rel="stylesheet" href="style.css?v=3">
-<script src="scanner.js?v=3" defer></script>
+<link rel="stylesheet" href="style.css?v=4">
+<script src="scanner.js?v=4" defer></script>
 </head>
 <body>
 <header class="top"><div class="wrap brand"><span class="brand-mark" aria-hidden="true"><i></i></span> <span dir="ltr">Karim Scanner</span></div></header>
@@ -30,7 +30,8 @@
     <button type="button" class="subtle" id="close-camera">اقفل الكاميرا</button>
   </div>
   <p class="hint" id="capture-count"></p>
-  <video id="live" autoplay muted playsinline aria-label="معاينة الكاميرا"></video>
+  <video id="live" autoplay muted playsinline aria-label="معاينة الكاميرا" aria-describedby="camera-framing"></video>
+  <p class="hint" id="camera-framing">خلّي الأربع زوايا جوّه الكادر.</p>
   <button type="button" class="primary wide" id="snap" disabled>صوّر الصفحة</button>
   <p id="camera-status" class="hint" role="status" hidden></p>
   <button type="button" class="secondary wide" id="native-camera" hidden>استخدم كاميرا التليفون</button>
