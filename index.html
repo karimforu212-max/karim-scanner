@@ -6,8 +6,8 @@
 <meta name="theme-color" content="#101b2e">
 <meta name="description" content="قص المستندات وحوّل الصور إلى PDF على الآيفون والكمبيوتر.">
 <title>Karim Scanner | كريم سكانر</title>
-<link rel="stylesheet" href="style.css?v=4">
-<script src="scanner.js?v=4" defer></script>
+<link rel="stylesheet" href="style.css?v=5">
+<script src="scanner.js?v=5" defer></script>
 </head>
 <body>
 <header class="top"><div class="wrap brand"><span class="brand-mark" aria-hidden="true"><i></i></span> <span dir="ltr">Karim Scanner</span></div></header>
@@ -30,8 +30,12 @@
     <button type="button" class="subtle" id="close-camera">اقفل الكاميرا</button>
   </div>
   <p class="hint" id="capture-count"></p>
-  <video id="live" autoplay muted playsinline aria-label="معاينة الكاميرا" aria-describedby="camera-framing"></video>
+  <div class="viewfinder" id="viewfinder">
+    <video id="live" autoplay muted playsinline aria-label="معاينة الكاميرا" aria-describedby="camera-framing"></video>
+    <canvas id="camera-guide" aria-hidden="true"></canvas>
+  </div>
   <p class="hint" id="camera-framing">خلّي الأربع زوايا جوّه الكادر.</p>
+  <label class="capture-option" id="auto-capture-option"><input id="auto-capture" type="checkbox"> صوّر تلقائي لما الورقة تثبت</label>
   <button type="button" class="primary wide" id="snap" disabled>صوّر الصفحة</button>
   <p id="camera-status" class="hint" role="status" hidden></p>
   <button type="button" class="secondary wide" id="native-camera" hidden>استخدم كاميرا التليفون</button>
@@ -46,10 +50,21 @@
     <button type="button" class="subtle" id="toggle-crop">ظبّط القص</button>
   </div>
   <div class="strip" id="pages" aria-label="اختيار الصفحة"></div>
+  <div class="row page-order" id="page-order" hidden>
+    <button type="button" class="subtle" id="move-earlier">قدّم الصفحة</button>
+    <button type="button" class="subtle" id="move-later">أخّر الصفحة</button>
+  </div>
   <div class="preview">
     <canvas id="photo" aria-label="معاينة صورة الورقة"></canvas>
     <canvas id="outline" aria-label="اسحب زوايا القص"></canvas>
   </div>
+  <fieldset class="quality page-look" id="page-look" hidden>
+    <legend>شكل الصفحة</legend>
+    <label><input type="radio" name="look" value="original"> الأصلية</label>
+    <label><input type="radio" name="look" value="color" checked> ألوان أوضح</label>
+    <label><input type="radio" name="look" value="mono"> أبيض وأسود</label>
+  </fieldset>
+  <button type="button" class="subtle" id="apply-look" hidden>طبّق الشكل على كل الصفحات</button>
   <p class="hint" id="crop-hint">اسحب الزوايا لو محتاج تعدّل القص.</p>
   <div class="row tools">
     <button type="button" class="subtle" id="full">الصورة كاملة</button>
@@ -71,6 +86,7 @@
     <legend>جودة الـPDF</legend>
     <label><input type="radio" name="quality" value="clear" checked> أوضح</label>
     <label><input type="radio" name="quality" value="light"> أخف</label>
+    <label><input type="radio" name="quality" value="compact"> أصغر حجم</label>
   </fieldset>
   <button type="button" id="build" class="primary wide">جهّز PDF</button>
   <div id="result" hidden>

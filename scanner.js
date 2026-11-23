@@ -11,7 +11,7 @@ function validQuad(points) {
   return points.every((point, i) => cross(point, points[(i + 1) % 4], points[(i + 2) % 4]) > .003);
 }
 
-function findPaper(rgba, width, height) {
+function findPaper(rgba, width, height, requireWholePage = false) {
   if (width < 12 || height < 12) return null;
   const gray = new Uint8Array(width * height);
   for (let i = 0; i < gray.length; i++) {
@@ -22,7 +22,7 @@ function findPaper(rgba, width, height) {
   const right = fitPaperSide(gray, width, height, true, true);
   const bottom = fitPaperSide(gray, width, height, false, true);
   const left = fitPaperSide(gray, width, height, true, false);
-  if ([top, right, bottom, left].filter(Boolean).length < 2) return null;
+  if ([top, right, bottom, left].filter(Boolean).length < (requireWholePage ? 4 : 2)) return null;
 
   // An unconfirmed edge stays at the frame. Printed lines and shadows can
   // split a bright paper region, so a color mask alone must never cut a side.
@@ -34,6 +34,7 @@ function findPaper(rgba, width, height) {
     intersection(right || [1, 0], top || [0, 0]),
     intersection(right || [1, 0], bottom || [1, 0]),
     intersection(left || [0, 0], bottom || [1, 0])];
+  if (requireWholePage && corners.some(point => point.some(value => value < .016 || value > .984))) return null;
   const area = (cross(corners[0], corners[1], corners[2]) + cross(corners[0], corners[2], corners[3])) / 2;
   return area > .18 && area < .985 && validQuad(corners) ? corners : null;
 }
@@ -224,13 +225,20 @@ function straighten(source, quad, limit) {
   return canvas;
 }
 
-function cleanPaperHighlights(canvas) {
+function applyPaperLook(canvas, look) {
+  if (look === "original") return;
   const ctx = canvas.getContext("2d");
   const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = pixels.data;
   for (let i = 0; i < data.length; i += 4) {
     const low = Math.min(data[i], data[i + 1], data[i + 2]);
     const high = Math.max(data[i], data[i + 1], data[i + 2]);
+    if (look === "mono") {
+      const luminance = (77 * data[i] + 150 * data[i + 1] + 29 * data[i + 2]) >> 8;
+      const shade = clamp(Math.round((luminance - 128) * 1.24 + 135), 0, 255);
+      data[i] = data[i + 1] = data[i + 2] = shade;
+      continue;
+    }
     // Clean near-white paper texture while retaining colored and dark markings.
     if (low < 216 || high - low > 12) continue;
     const lift = Math.min(255 - high, Math.round((low - 216) * .28));
@@ -242,8 +250,12 @@ function cleanPaperHighlights(canvas) {
 }
 
 async function compressPage(page, budget, qualityMode) {
-  const preset = qualityMode === "light" ? {edge: 1450, qualities: [.64, .54, .46]} :
-    {edge: 1850, qualities: [.76, .66, .56, .46]};
+  const presets = {
+    clear: {edge: 1850, qualities: [.76, .66, .56, .46]},
+    light: {edge: 1450, qualities: [.64, .54, .46]},
+    compact: {edge: 1150, qualities: [.57, .49, .42]}
+  };
+  const preset = presets[qualityMode];
   const source = await loadPhoto(page.file, 2500, page.turns);
   let documentCanvas;
   try {
@@ -252,7 +264,7 @@ async function compressPage(page, budget, qualityMode) {
     releaseCanvas(source);
   }
   try {
-    cleanPaperHighlights(documentCanvas);
+    applyPaperLook(documentCanvas, page.look);
     let canvas = documentCanvas;
     try {
       while (true) {
@@ -332,9 +344,13 @@ function startScanner() {
   const formatter = new Intl.NumberFormat("ar-EG", {maximumFractionDigits: 2});
   let active = -1, busy = false, drag = null, output = null, outputUrl = null;
   const photo = $("photo"), outline = $("outline"), video = $("live");
+  const lookInputs = [...document.querySelectorAll('[name="look"]')];
   const qualityInputs = [...document.querySelectorAll('[name="quality"]')];
   let pending = null, editCrop = false, capturing = false, stream = null, request = 0;
   const currentPage = () => pending || pages[active];
+  const liveSample = makeCanvas(1, 1);
+  const liveContext = liveSample.getContext("2d", {willReadFrequently:true});
+  let guideTimer = null, guideQuad = null, lastShotGuide = null, stillSince = null, changedFrames = 0;
   const defaultName = () => {
     const now = new Date();
     const date = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map(n => String(n).padStart(2, "0")).join("-");
@@ -350,10 +366,12 @@ function startScanner() {
   function setBusy(value) {
     busy = value;
     for (const id of ["auto","full","rotate","remove","build","filename","share","toggle-crop",
-      "accept-next","accept-stop","retake","native-camera"]) $(id).disabled = value;
+      "accept-next","accept-stop","retake","native-camera","apply-look"]) $(id).disabled = value;
     $("take").disabled = $("pick").disabled = value || capturing || Boolean(pending);
     $("snap").disabled = value || !stream || video.readyState < 2;
-    for (const input of qualityInputs) input.disabled = value;
+    $("move-earlier").disabled = value || active < 1;
+    $("move-later").disabled = value || active >= pages.length - 1;
+    for (const input of [...qualityInputs, ...lookInputs]) input.disabled = value;
     for (const button of $("pages").children) button.disabled = value;
   }
 
@@ -409,9 +427,14 @@ function startScanner() {
     $("capture-area").hidden = !capturing || Boolean(pending);
     $("editor").hidden = !page || (capturing && !pending);
     $("export").hidden = active < 0 || Boolean(pending) || capturing;
-    $("review-heading").hidden = $("review-buttons").hidden = !pending;
+    $("review-heading").hidden = !page;
+    $("review-count").hidden = !pending;
+    $("review-buttons").hidden = !pending;
     $("edit-title").textContent = pending ? "راجع اللقطة" : "حدود الورقة";
     $("pages").hidden = Boolean(pending);
+    $("page-order").hidden = Boolean(pending) || pages.length < 2;
+    $("move-earlier").disabled = busy || active < 1;
+    $("move-later").disabled = busy || active >= pages.length - 1;
     $("remove").hidden = Boolean(pending);
     $("accept-next").hidden = pages.length + 1 >= MAX_PAGES;
     $("capture-count").textContent = "صوّر صفحة " + formatter.format(pages.length + 1) + " من حد ٣٠ صفحة";
@@ -423,15 +446,20 @@ function startScanner() {
       return;
     }
     if (!pending && !capturing) {
-      $("pages").replaceChildren(...pages.map((_, index) => {
+      $("pages").replaceChildren(...pages.map((sheet, index) => {
         const button = document.createElement("button");
         button.type = "button";
-        button.className = "subtle";
-        button.textContent = "صفحة " + formatter.format(index + 1);
+        button.className = "subtle page-tile";
+        const scale = 48 / Math.max(sheet.preview.width, sheet.preview.height);
+        const thumb = makeCanvas(Math.max(1, Math.round(sheet.preview.width * scale)), Math.max(1, Math.round(sheet.preview.height * scale)));
+        thumb.getContext("2d").drawImage(sheet.preview, 0, 0, thumb.width, thumb.height);
+        thumb.setAttribute("aria-hidden", "true");
+        button.append(thumb, "صفحة " + formatter.format(index + 1));
         button.setAttribute("aria-current", String(index === active));
         button.disabled = busy;
         button.addEventListener("click", () => {
           active = index;
+          editCrop = !pages[index].detected;
           showPage();
           $("pages").children[index].focus({preventScroll: true});
         });
@@ -441,21 +469,27 @@ function startScanner() {
     }
     if ($("editor").hidden) return;
 
-    const cropped = pending && !editCrop;
+    const cropped = !editCrop;
+    $("page-look").hidden = !cropped;
+    $("apply-look").hidden = !cropped || Boolean(pending) || pages.length < 2;
+    for (const input of lookInputs) input.checked = input.value === page.look;
     let preview = page.preview;
-    if (cropped) preview = straighten(page.preview, page.quad, 720);
+    if (cropped) {
+      preview = straighten(page.preview, page.quad, 720);
+      applyPaperLook(preview, page.look);
+    }
     photo.width = outline.width = preview.width;
     photo.height = outline.height = preview.height;
     photo.getContext("2d").drawImage(preview, 0, 0);
     if (cropped) releaseCanvas(preview);
-    outline.hidden = $("auto").hidden = $("full").hidden = Boolean(cropped);
+    outline.hidden = $("full").hidden = Boolean(cropped);
     $("toggle-crop").textContent = editCrop ? "شوف بعد القص" : "ظبّط القص";
     if (!cropped) redraw();
     cropHint();
   }
 
   function cropHint() {
-    $("crop-hint").textContent = pending && !editCrop ? "دي معاينة الصفحة اللي هتتحفظ في الـPDF." :
+    $("crop-hint").textContent = !editCrop ? "دي معاينة الصفحة اللي هتتحفظ في الـPDF." :
       currentPage().detected ? "اسحب الزوايا لو محتاج تعدّل القص." :
         "اسحب الزوايا على حواف الورقة عشان تحدّد القص.";
   }
@@ -463,7 +497,7 @@ function startScanner() {
   async function preparePage(file) {
     const preview = await loadPhoto(file, 720);
     const detected = detectOnCanvas(preview);
-    return {file, preview, quad: detected || fullFrame(), detected: Boolean(detected), turns: 0};
+    return {file, preview, quad: detected || fullFrame(), detected: Boolean(detected), turns: 0, look: "color"};
   }
 
 
@@ -488,6 +522,7 @@ function startScanner() {
       }
       if (pages.length > first) {
         active = first;
+        editCrop = !pages[active].detected;
         invalidate();
         showPage();
       }
@@ -504,10 +539,79 @@ function startScanner() {
     $("camera-status").textContent = message;
     $("camera-status").hidden = !message;
     $("native-camera").hidden = !fallback;
-    video.hidden = $("snap").hidden = $("camera-framing").hidden = fallback;
+    $("viewfinder").hidden = $("snap").hidden = $("camera-framing").hidden = fallback;
+    $("auto-capture-option").hidden = fallback;
   }
 
+  function drawCameraGuide(points, ready) {
+    const layer = $("camera-guide");
+    const width = Math.round(video.clientWidth), height = Math.round(video.clientHeight);
+    if (width < 1 || height < 1) return;
+    if (layer.width !== width || layer.height !== height) {
+      layer.width = width;
+      layer.height = height;
+    }
+    const ctx = layer.getContext("2d");
+    ctx.clearRect(0, 0, width, height);
+    if (!points) return;
+    const scale = Math.min(width / video.videoWidth, height / video.videoHeight);
+    const w = video.videoWidth * scale, h = video.videoHeight * scale;
+    ctx.beginPath();
+    points.forEach(([x, y], i) => {
+      const px = (width - w) / 2 + x * w, py = (height - h) / 2 + y * h;
+      if (i) ctx.lineTo(px, py);
+      else ctx.moveTo(px, py);
+    });
+    ctx.closePath();
+    ctx.fillStyle = "#72ecc41b";
+    ctx.strokeStyle = ready ? "#72ecc4" : "#ffd781";
+    ctx.lineWidth = ready ? 3 : 2;
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  function updateCameraGuide() {
+    if (busy || pending || !capturing || !stream || video.readyState < 2) return;
+    const scale = 275 / Math.max(video.videoWidth, video.videoHeight);
+    const width = Math.max(1, Math.round(video.videoWidth * scale));
+    const height = Math.max(1, Math.round(video.videoHeight * scale));
+    if (width !== liveSample.width || height !== liveSample.height) {
+      liveSample.width = width;
+      liveSample.height = height;
+    }
+    liveContext.drawImage(video, 0, 0, width, height);
+    const points = findPaper(liveContext.getImageData(0, 0, width, height).data, width, height, true);
+    const motion = (a, b) => Math.max(...a.map((point, i) => distance(point, b[i])));
+    if (lastShotGuide) {
+      changedFrames = !points || motion(points, lastShotGuide) > .085 ? changedFrames + 1 : 0;
+      if (changedFrames >= 2) lastShotGuide = null;
+    }
+    const time = performance.now();
+    if (!points) {
+      guideQuad = stillSince = null;
+    } else if (!guideQuad || motion(points, guideQuad) > .028) {
+      guideQuad = points;
+      stillSince = time;
+    } else {
+      guideQuad = points.map(([x,y], i) => [
+        guideQuad[i][0] * .55 + x * .45, guideQuad[i][1] * .55 + y * .45
+      ]);
+    }
+    const ready = Boolean(guideQuad && time - stillSince >= 800);
+    drawCameraGuide(guideQuad, ready);
+    const automatic = $("auto-capture").checked;
+    const hint = lastShotGuide && automatic ? "حرّك الورقة أو بدّلها عشان التصوير التلقائي يبدأ تاني." :
+      ready ? "الورقة ثابتة والحواف واضحة." : points ? "ثبّت الموبايل لحظة." : "خلّي الأربع زوايا جوّه الكادر.";
+    if ($("camera-framing").textContent !== hint) $("camera-framing").textContent = hint;
+    if (ready && automatic && !lastShotGuide) $("snap").click();
+  }
+
+
   function releaseStream() {
+    clearInterval(guideTimer);
+    guideTimer = guideQuad = lastShotGuide = stillSince = null;
+    changedFrames = 0;
+    releaseCanvas($("camera-guide"));
     if (stream) for (const track of stream.getTracks()) track.stop();
     stream = null;
     video.srcObject = null;
@@ -558,7 +662,10 @@ function startScanner() {
       });
       video.srcObject = camera;
       await video.play();
-      if (opening === request) cameraStatus("");
+      if (opening === request) {
+        cameraStatus("");
+        guideTimer = setInterval(updateCameraGuide, 270);
+      }
     } catch {
       if (opening === request) {
         releaseStream();
@@ -611,6 +718,9 @@ function startScanner() {
   $("snap").addEventListener("click", async () => {
     if (busy || pending || !stream || video.readyState < 2) return;
     const opening = request;
+    lastShotGuide = guideQuad;
+    stillSince = null;
+    changedFrames = 0;
     const scale = Math.min(1, 2500 / Math.max(video.videoWidth, video.videoHeight));
     const canvas = makeCanvas(Math.max(1, Math.round(video.videoWidth * scale)),
       Math.max(1, Math.round(video.videoHeight * scale)));
@@ -687,12 +797,15 @@ function startScanner() {
     currentPage().detected = true;
     cropHint();
     if (!pending) invalidate();
-    redraw();
+    if (!outline.hidden) redraw();
   }
 
   $("auto").addEventListener("click", () => {
     const found = detectOnCanvas(currentPage().preview);
-    if (found) setQuad(found);
+    if (found) {
+      setQuad(found);
+      showPage();
+    }
     notice(found ? "" : "الحواف مش واضحة. اسحب الأربع زوايا عشان تحدّد الورقة.");
   });
   $("full").addEventListener("click", () => {
@@ -717,10 +830,23 @@ function startScanner() {
     releaseCanvas(pages[active].preview);
     pages.splice(active, 1);
     active = Math.min(active, pages.length - 1);
+    editCrop = active >= 0 && !pages[active].detected;
     invalidate();
     notice();
     showPage();
   });
+
+  function movePage(offset) {
+    const next = active + offset;
+    if (busy || pending || active < 0 || next < 0 || next >= pages.length) return;
+    [pages[active], pages[next]] = [pages[next], pages[active]];
+    active = next;
+    invalidate();
+    showPage();
+  }
+
+  $("move-earlier").addEventListener("click", () => movePage(-1));
+  $("move-later").addEventListener("click", () => movePage(1));
 
   function pointer(event) {
     const rect = outline.getBoundingClientRect();
@@ -746,6 +872,19 @@ function startScanner() {
   });
   outline.addEventListener("lostpointercapture", () => { drag = null; });
   window.addEventListener("resize", () => { if (currentPage() && !$("editor").hidden && !outline.hidden) redraw(); });
+
+  for (const input of lookInputs) input.addEventListener("change", () => {
+    currentPage().look = input.value;
+    if (!pending) invalidate();
+    showPage();
+  });
+
+  $("apply-look").addEventListener("click", () => {
+    const look = currentPage().look;
+    for (const page of pages) page.look = look;
+    invalidate();
+    notice("اتطبّق نفس الشكل على كل الصفحات.");
+  });
 
   for (const input of qualityInputs) input.addEventListener("change", invalidate);
 
