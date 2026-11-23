@@ -225,29 +225,103 @@ function straighten(source, quad, limit) {
   return canvas;
 }
 
+function estimatePaperLight(data, width, height) {
+  const step = Math.max(1, Math.floor(Math.max(width, height) / 280));
+  const tileSize = Math.max(8, Math.ceil(Math.max(width, height) / 16));
+  const columns = Math.ceil(width / tileSize), rows = Math.ceil(height / tileSize);
+  const grid = new Float32Array(columns * rows);
+  const histogram = new Uint16Array(256);
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      histogram.fill(0);
+      let count = 0;
+      for (let y = row * tileSize; y < Math.min(height, (row + 1) * tileSize); y += step) {
+        for (let x = column * tileSize; x < Math.min(width, (column + 1) * tileSize); x += step) {
+          const i = (y * width + x) * 4;
+          const r = data[i], g = data[i + 1], b = data[i + 2];
+          if (Math.max(r,g,b) - Math.min(r,g,b) > 44) continue;
+          histogram[(77*r + 150*g + 29*b) >> 8]++;
+          count++;
+        }
+      }
+      let seen = 0;
+      let shade = 0;
+      for (; shade < 255; shade++) {
+        seen += histogram[shade];
+        if (seen >= Math.ceil(count * .82)) break;
+      }
+      grid[row * columns + column] = count ? shade : 0;
+    }
+  }
+
+  // Interpolate nearby paper estimates. A dark block or solid colored stamp
+  // can lack paper samples, so borrow from its neighbours before normalizing.
+  const light = grid.slice();
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      const i = row * columns + column;
+      let sum = grid[i] >= 105 ? grid[i] * 5 : 0;
+      let weight = sum ? 5 : 0;
+      for (let y = Math.max(0, row - 1); y <= Math.min(rows - 1, row + 1); y++) {
+        for (let x = Math.max(0, column - 1); x <= Math.min(columns - 1, column + 1); x++) {
+          const nearby = y * columns + x;
+          if (nearby === i || grid[nearby] < 105) continue;
+          sum += grid[nearby];
+          weight++;
+        }
+      }
+      light[i] = weight ? sum / weight : 170;
+    }
+  }
+  return {light, columns, rows, tileSize};
+}
+
 function applyPaperLook(canvas, look) {
   if (look === "original") return;
+  const {width, height} = canvas;
   const ctx = canvas.getContext("2d");
-  const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const pixels = ctx.getImageData(0, 0, width, height);
   const data = pixels.data;
-  for (let i = 0; i < data.length; i += 4) {
-    const low = Math.min(data[i], data[i + 1], data[i + 2]);
-    const high = Math.max(data[i], data[i + 1], data[i + 2]);
-    if (look === "mono") {
-      const luminance = (77 * data[i] + 150 * data[i + 1] + 29 * data[i + 2]) >> 8;
-      const shade = clamp(Math.round((luminance - 128) * 1.24 + 135), 0, 255);
-      data[i] = data[i + 1] = data[i + 2] = shade;
-      continue;
+  const {light, columns, rows, tileSize} = estimatePaperLight(data, width, height);
+  const mono = look === "mono";
+  const tones = Uint8Array.from({length: 286}, (_, i) =>
+    Math.min(255, Math.round(248 * (i / 255) ** (mono ? 1.57 : 1.34))));
+  const xTile = new Uint16Array(width);
+  const xMix = new Float32Array(width);
+  for (let x = 0; x < width; x++) {
+    const col = clamp(x / tileSize - .5, 0, columns - 1);
+    xTile[x] = Math.floor(col);
+    xMix[x] = col - xTile[x];
+  }
+  for (let y = 0; y < height; y++) {
+    const row = clamp(y / tileSize - .5, 0, rows - 1);
+    const base = Math.floor(row);
+    const top = base * columns, bottom = Math.min(rows - 1, base + 1) * columns;
+    const mix = row - base;
+    for (let x = 0; x < width; x++) {
+      const column = xTile[x], next = Math.min(columns - 1, column + 1);
+      const up = light[top + column] + (light[top + next] - light[top + column]) * xMix[x];
+      const down = light[bottom + column] + (light[bottom + next] - light[bottom + column]) * xMix[x];
+      const paper = up + (down - up) * mix;
+      const at = (y * width + x) * 4;
+      const r = data[at], g = data[at + 1], b = data[at + 2];
+      const luminance = (77*r + 150*g + 29*b) >> 8;
+      const tone = tones[Math.min(285, Math.round(255 * luminance / paper))];
+      if (mono) {
+        data[at] = data[at + 1] = data[at + 2] = tone;
+        continue;
+      }
+      const spread = Math.max(r,g,b) - Math.min(r,g,b);
+      const strength = 1 - .64 * clamp((spread - 16) / 34, 0, 1);
+      const shift = (tone - luminance) * strength;
+      data[at] = r + shift;
+      data[at + 1] = g + shift;
+      data[at + 2] = b + shift;
     }
-    // Clean near-white paper texture while retaining colored and dark markings.
-    if (low < 216 || high - low > 12) continue;
-    const lift = Math.min(255 - high, Math.round((low - 216) * .28));
-    data[i] += lift;
-    data[i + 1] += lift;
-    data[i + 2] += lift;
   }
   ctx.putImageData(pixels, 0, 0);
 }
+
 
 async function compressPage(page, budget, qualityMode) {
   const presets = {
