@@ -50,8 +50,8 @@ function fitPaperSide(gray, width, height, vertical, reverse) {
     return vertical ? gray[y * width + normal] : gray[normal * width + y];
   };
 
-  for (let step = 0; step < 27; step++) {
-    const run = .14 + .72 * step / 26;
+  for (let step = 0; step < 35; step++) {
+    const run = .08 + .84 * step / 34;
     const y = Math.round(run * (along - 1));
     const candidates = [];
     for (let x = inset * 2; x < across * .43; x++) {
@@ -68,7 +68,15 @@ function fitPaperSide(gray, width, height, vertical, reverse) {
         get(Math.max(0, x - band * 2), y), get(Math.max(0, x - band * 3), y));
       const wideContrast = inside - background;
       if (inside < 108 || wideContrast < 12 || wideContrast < contrast * .44) continue;
-      candidates.push({pos: x / (across - 1), weight: Math.min(contrast, wideContrast, 70)});
+      // The wider strips confirm a paper/background change. The narrow
+      // gradient locates the boundary instead of picking a nearby point
+      // in the broad contrast band.
+      const before = get(x - 1, y) + get(x - 2, y) + get(x - 1, y - 1) + get(x - 1, y + 1);
+      const after = get(x + 1, y) + get(x + 2, y) + get(x + 1, y - 1) + get(x + 1, y + 1);
+      const edge = (after - before) / 4;
+      if (edge < 8 || edge < contrast * .34) continue;
+      const weight = Math.min(edge, 85) * .72 + Math.min(wideContrast, 55) * .28;
+      candidates.push({pos: x / (across - 1), weight});
     }
     candidates.sort((a, b) => b.weight - a.weight);
     const peaks = [];
@@ -82,9 +90,9 @@ function fitPaperSide(gray, width, height, vertical, reverse) {
 
   let best = null;
   let bestScore = 0;
-  const tolerance = .021;
+  const tolerance = .016;
   for (let i = 0; i < readings.length; i++) {
-    for (let j = i + 10; j < readings.length; j++) {
+    for (let j = i + 13; j < readings.length; j++) {
       const start = readings[i], end = readings[j];
       for (const a of start.peaks) {
         for (const b of end.peaks) {
@@ -100,9 +108,9 @@ function fitPaperSide(gray, width, height, vertical, reverse) {
             score += 1 + match.weight / 80 - Math.abs(match.pos - estimated) / tolerance * .35;
             support.push([row.run, match.pos]);
           }
-          if (support.length < 14 || support.at(-1)[0] - support[0][0] < .46) continue;
+          if (support.length < 14 || support.at(-1)[0] - support[0][0] < .47) continue;
           // When two lines have similar support, prefer the outer paper boundary.
-          score -= 12 * (offset + slope * .5);
+          score -= 5 * (offset + slope * .5);
           if (score <= bestScore) continue;
           best = support;
           bestScore = score;
@@ -121,7 +129,7 @@ function fitPaperSide(gray, width, height, vertical, reverse) {
   const count = best.length;
   const slope = (count * sumXY - sumX * sumY) / (count * sumXX - sumX * sumX);
   // Leave a narrow safety margin for uneven or curled sheet edges.
-  const offset = (sumY - slope * sumX) / count - .012;
+  const offset = (sumY - slope * sumX) / count - .006;
   return reverse ? [1 - offset, -slope] : [offset, slope];
 }
 
