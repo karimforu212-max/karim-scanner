@@ -25,6 +25,7 @@ function hull(points) {
 }
 
 function findPaper(rgba, width, height) {
+  if (width < 12 || height < 12) return null;
   const length = width * height;
   const gray = new Uint8Array(length);
   const histogram = new Uint32Array(256);
@@ -112,8 +113,122 @@ function findPaper(rgba, width, height) {
     selected = ordered;
     largest = tail;
   }
-  return selected;
+  return refinePaperEdges(gray, width, height, selected);
 }
+
+function fitPaperSide(gray, width, height, vertical, reverse) {
+  const across = vertical ? width : height;
+  const along = vertical ? height : width;
+  const inset = Math.max(2, Math.round(across * .009));
+  const readings = [];
+  const get = (x, y) => {
+    const normal = reverse ? across - 1 - x : x;
+    return vertical ? gray[y * width + normal] : gray[normal * width + y];
+  };
+
+  for (let step = 0; step < 27; step++) {
+    const run = .14 + .72 * step / 26;
+    const y = Math.round(run * (along - 1));
+    const candidates = [];
+    for (let x = inset * 2; x < across * .43; x++) {
+      // A paper edge has a sustained jump toward the inside. Averaging strips
+      // discounts individual letters, reflections and compression noise.
+      const outer = get(x - inset, y) + get(x - 2 * inset, y) + get(x - 2 * inset, y - 1);
+      const inner = get(x + inset, y) + get(x + 2 * inset, y) + get(x + 2 * inset, y + 1);
+      const contrast = (inner - outer) / 3;
+      if (contrast < 15 || inner < 345) continue;
+      candidates.push({pos: x / (across - 1), weight: Math.min(contrast, 70)});
+    }
+    candidates.sort((a, b) => b.weight - a.weight);
+    const peaks = [];
+    for (const point of candidates) {
+      if (peaks.some(other => Math.abs(other.pos - point.pos) < .022)) continue;
+      peaks.push(point);
+      if (peaks.length === 4) break;
+    }
+    readings.push({run, peaks});
+  }
+
+  let best = null;
+  let bestScore = 0;
+  const tolerance = .021;
+  for (let i = 0; i < readings.length; i++) {
+    for (let j = i + 10; j < readings.length; j++) {
+      const start = readings[i], end = readings[j];
+      for (const a of start.peaks) {
+        for (const b of end.peaks) {
+          const slope = (b.pos - a.pos) / (end.run - start.run);
+          const offset = a.pos - slope * start.run;
+          if (Math.abs(slope) > .47 || Math.min(offset, offset + slope) < -.11) continue;
+          const support = [];
+          let score = 0;
+          for (const row of readings) {
+            const estimated = offset + slope * row.run;
+            const match = row.peaks.find(p => Math.abs(p.pos - estimated) <= tolerance);
+            if (!match) continue;
+            score += 1 + match.weight / 80 - Math.abs(match.pos - estimated) / tolerance * .35;
+            support.push([row.run, match.pos]);
+          }
+          if (support.length < 12 || support.at(-1)[0] - support[0][0] < .4) continue;
+          // When two lines have similar support, prefer the outer paper boundary.
+          score -= 12 * (offset + slope * .5);
+          if (score <= bestScore) continue;
+          best = support;
+          bestScore = score;
+        }
+      }
+    }
+  }
+  if (!best) return null;
+  let sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
+  for (const [x, y] of best) {
+    sumX += x;
+    sumY += y;
+    sumXX += x * x;
+    sumXY += x * y;
+  }
+  const count = best.length;
+  const slope = (count * sumXY - sumX * sumY) / (count * sumXX - sumX * sumX);
+  const offset = (sumY - slope * sumX) / count;
+  return reverse ? [1 - offset, -slope] : [offset, slope];
+}
+
+function refinePaperEdges(gray, width, height, fallback) {
+  const frame = fallback || fullFrame();
+  const sides = [fitPaperSide(gray, width, height, false, false),
+    fitPaperSide(gray, width, height, true, true),
+    fitPaperSide(gray, width, height, false, true),
+    fitPaperSide(gray, width, height, true, false)];
+  if (!fallback && sides.filter(Boolean).length < 3) return null;
+  for (let i = 0; i < 4; i++) {
+    if (!sides[i] || !fallback) continue;
+    const xAxis = i % 2 === 0;
+    const axis = xAxis ? 0 : 1, normal = 1 - axis;
+    const a = frame[i], b = frame[(i + 1) % 4];
+    // Use the mask where it already reaches a realistic edge. A conflicting
+    // interior line can be a crease, print or the boundary of a hard shadow.
+    const displacement = ([x,y]) => Math.abs(sides[i][0] + sides[i][1] * (axis === 0 ? x : y) - (normal === 0 ? x : y));
+    if (displacement(a) > .095 || displacement(b) > .095) sides[i] = null;
+  }
+  const edge = (i) => {
+    if (sides[i]) return sides[i];
+    const axis = i % 2, normal = 1 - axis;
+    const a = frame[i], b = frame[(i + 1) % 4];
+    const slope = (b[normal] - a[normal]) / (b[axis] - a[axis]);
+    return [a[normal] - slope * a[axis], slope];
+  };
+  const intersection = ([v, vy], [h, hx]) => {
+    const y = (h + hx * v) / (1 - hx * vy);
+    return [clamp(v + vy * y, 0, 1), clamp(y, 0, 1)];
+  };
+  const [top, right, bottom, left] = [0, 1, 2, 3].map(edge);
+  const corners = [intersection(left, top), intersection(right, top),
+    intersection(right, bottom), intersection(left, bottom)];
+  const area = (cross(corners[0], corners[1], corners[2]) + cross(corners[0], corners[2], corners[3])) / 2;
+  return area > .16 && area < .98 && validQuad(corners) ? corners : fallback;
+}
+
+
 
 function makeCanvas(width, height) {
   const canvas = document.createElement("canvas");
@@ -232,11 +347,13 @@ function cleanPaperHighlights(canvas) {
   ctx.putImageData(pixels, 0, 0);
 }
 
-async function compressPage(page, budget) {
+async function compressPage(page, budget, qualityMode) {
+  const preset = qualityMode === "light" ? {edge: 1450, qualities: [.64, .54, .46]} :
+    {edge: 1850, qualities: [.76, .66, .56, .46]};
   const source = await loadPhoto(page.file, 2500, page.turns);
   let documentCanvas;
   try {
-    documentCanvas = straighten(source, page.quad, 1850);
+    documentCanvas = straighten(source, page.quad, preset.edge);
   } finally {
     releaseCanvas(source);
   }
@@ -245,7 +362,7 @@ async function compressPage(page, budget) {
     let canvas = documentCanvas;
     try {
       while (true) {
-        for (const quality of [.76, .66, .56, .46]) {
+        for (const quality of preset.qualities) {
           const jpeg = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
           if (!jpeg) throw new Error("JPEG encoding failed");
           if (jpeg.size <= budget) return {jpeg, width: canvas.width, height: canvas.height};
@@ -320,7 +437,10 @@ function startScanner() {
   const pages = [];
   const formatter = new Intl.NumberFormat("ar-EG", {maximumFractionDigits: 2});
   let active = -1, busy = false, drag = null, output = null, outputUrl = null;
-  const photo = $("photo"), outline = $("outline");
+  const photo = $("photo"), outline = $("outline"), video = $("live");
+  const qualityInputs = [...document.querySelectorAll('[name="quality"]')];
+  let pending = null, editCrop = false, capturing = false, stream = null, request = 0;
+  const currentPage = () => pending || pages[active];
   const defaultName = () => {
     const now = new Date();
     const date = [now.getFullYear(), now.getMonth() + 1, now.getDate()].map(n => String(n).padStart(2, "0")).join("-");
@@ -335,9 +455,14 @@ function startScanner() {
 
   function setBusy(value) {
     busy = value;
-    for (const id of ["take","pick","auto","full","rotate","remove","build","filename","share"]) $(id).disabled = value;
+    for (const id of ["auto","full","rotate","remove","build","filename","share","toggle-crop",
+      "accept-next","accept-stop","retake","native-camera"]) $(id).disabled = value;
+    $("take").disabled = $("pick").disabled = value || capturing || Boolean(pending);
+    $("snap").disabled = value || !stream || video.readyState < 2;
+    for (const input of qualityInputs) input.disabled = value;
     for (const button of $("pages").children) button.disabled = value;
   }
+
 
   function filename() {
     const name = $("filename").value.trim().replace(/(?:\.pdf)+$/gi, "").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "-").replace(/^[. ]+|[. ]+$/g, "");
@@ -357,7 +482,7 @@ function startScanner() {
     outline.style.height = bounds.height + "px";
     const ctx = outline.getContext("2d");
     ctx.clearRect(0, 0, outline.width, outline.height);
-    const positions = pages[active].quad.map(([x,y]) => [x * (outline.width - 1), y * (outline.height - 1)]);
+    const positions = currentPage().quad.map(([x,y]) => [x * (outline.width - 1), y * (outline.height - 1)]);
     const trace = () => {
       ctx.moveTo(...positions[0]);
       for (const p of positions.slice(1)) ctx.lineTo(...p);
@@ -386,40 +511,67 @@ function startScanner() {
   }
 
   function showPage() {
-    $("editor").hidden = $("export").hidden = active < 0;
-    if (active < 0) {
+    const page = currentPage();
+    $("capture-area").hidden = !capturing || Boolean(pending);
+    $("editor").hidden = !page || (capturing && !pending);
+    $("export").hidden = active < 0 || Boolean(pending) || capturing;
+    $("review-heading").hidden = $("review-buttons").hidden = !pending;
+    $("edit-title").textContent = pending ? "راجع اللقطة" : "حدود الورقة";
+    $("pages").hidden = Boolean(pending);
+    $("remove").hidden = Boolean(pending);
+    $("accept-next").hidden = pages.length + 1 >= MAX_PAGES;
+    $("capture-count").textContent = "صوّر صفحة " + formatter.format(pages.length + 1) + " من حد ٣٠ صفحة";
+    $("review-count").textContent = "الصفحة " + formatter.format(pages.length + 1) + " · بعد المراجعة تتضاف للملف";
+    if (!page) {
       releaseCanvas(photo);
       releaseCanvas(outline);
       $("pages").replaceChildren();
       return;
     }
-    const page = pages[active];
-    $("pages").replaceChildren(...pages.map((_, index) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "subtle";
-      button.textContent = "صفحة " + formatter.format(index + 1);
-      button.setAttribute("aria-current", String(index === active));
-      button.disabled = busy;
-      button.addEventListener("click", () => {
-        active = index;
-        showPage();
-        $("pages").children[index].focus({preventScroll: true});
-      });
-      return button;
-    }));
-    $("pages").children[active].scrollIntoView({block:"nearest", inline:"nearest"});
-    photo.width = outline.width = page.preview.width;
-    photo.height = outline.height = page.preview.height;
-    photo.getContext("2d").drawImage(page.preview, 0, 0);
-    redraw();
+    if (!pending && !capturing) {
+      $("pages").replaceChildren(...pages.map((_, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "subtle";
+        button.textContent = "صفحة " + formatter.format(index + 1);
+        button.setAttribute("aria-current", String(index === active));
+        button.disabled = busy;
+        button.addEventListener("click", () => {
+          active = index;
+          showPage();
+          $("pages").children[index].focus({preventScroll: true});
+        });
+        return button;
+      }));
+      $("pages").children[active].scrollIntoView({block:"nearest", inline:"nearest"});
+    }
+    if ($("editor").hidden) return;
+
+    const cropped = pending && !editCrop;
+    let preview = page.preview;
+    if (cropped) preview = straighten(page.preview, page.quad, 720);
+    photo.width = outline.width = preview.width;
+    photo.height = outline.height = preview.height;
+    photo.getContext("2d").drawImage(preview, 0, 0);
+    if (cropped) releaseCanvas(preview);
+    outline.hidden = $("auto").hidden = $("full").hidden = Boolean(cropped);
+    $("toggle-crop").textContent = editCrop ? "شوف بعد القص" : "ظبّط القص";
+    if (!cropped) redraw();
     cropHint();
   }
 
   function cropHint() {
-    $("crop-hint").textContent = pages[active].detected ? "اسحب الزوايا لو محتاج تعدّل القص." :
-      "لو محتاج تقص الزيادات، اسحب الزوايا على حواف الورقة.";
+    $("crop-hint").textContent = pending && !editCrop ? "دي معاينة الصفحة اللي هتتحفظ في الـPDF." :
+      currentPage().detected ? "اسحب الزوايا لو محتاج تعدّل القص." :
+        "اسحب الزوايا على حواف الورقة عشان تحدّد القص.";
   }
+
+  async function preparePage(file) {
+    const preview = await loadPhoto(file, 720);
+    const detected = detectOnCanvas(preview);
+    return {file, preview, quad: detected || fullFrame(), detected: Boolean(detected), turns: 0};
+  }
+
 
   async function add(files) {
     if (busy || !files.length) return;
@@ -435,9 +587,7 @@ function startScanner() {
     try {
       for (const file of files.slice(0, remaining)) {
         try {
-          const preview = await loadPhoto(file, 720);
-          const detected = detectOnCanvas(preview);
-          pages.push({file, preview, quad: detected || fullFrame(), detected: Boolean(detected), turns: 0});
+          pages.push(await preparePage(file));
         } catch {
           failed++;
         }
@@ -456,25 +606,198 @@ function startScanner() {
     }
   }
 
-  for (const [button, input] of [["take","camera"],["pick","library"]]) {
-    $(button).addEventListener("click", () => $(input).click());
-    $(input).addEventListener("change", (event) => {
-      const files = Array.from(event.target.files);
-      event.target.value = "";
-      void add(files);
-    });
+  function cameraStatus(message, fallback = false) {
+    $("camera-status").textContent = message;
+    $("camera-status").hidden = !message;
+    $("native-camera").hidden = !fallback;
+    video.hidden = $("snap").hidden = fallback;
   }
 
-  function setQuad(points) {
-    pages[active].quad = points;
-    pages[active].detected = true;
-    cropHint();
+  function releaseStream() {
+    if (stream) for (const track of stream.getTracks()) track.stop();
+    stream = null;
+    video.srcObject = null;
+  }
+
+  function stopCapture() {
+    capturing = false;
+    request++;
+    releaseStream();
+    showPage();
+    setBusy(false);
+  }
+
+  async function showCamera() {
+    if (busy || pending) return;
+    if (pages.length >= MAX_PAGES) {
+      notice("الملف الواحد بياخد لحد ٣٠ صفحة.");
+      return;
+    }
+    capturing = true;
+    notice();
+    showPage();
+    $("capture-area").scrollIntoView({block:"start"});
+    if (stream?.active) {
+      void video.play().catch(() => cameraStatus("الكاميرا ما اشتغلتش هنا. جرّب كاميرا التليفون.", true));
+      setBusy(false);
+      return;
+    }
+
+    const opening = ++request;
+    setBusy(true);
+    cameraStatus("بنفتح الكاميرا…");
+    try {
+      const camera = await navigator.mediaDevices?.getUserMedia({
+        audio: false, video: {facingMode: {ideal: "environment"}, width: {ideal: 1920}, height: {ideal: 1920}}
+      });
+      if (!camera) throw new Error("Camera unavailable");
+      if (opening !== request) {
+        for (const track of camera.getTracks()) track.stop();
+        return;
+      }
+      stream = camera;
+      for (const track of camera.getVideoTracks()) track.addEventListener("ended", () => {
+        if (stream !== camera) return;
+        releaseStream();
+        cameraStatus("الكاميرا وقفت. كمّل من كاميرا التليفون.", true);
+        setBusy(false);
+      });
+      video.srcObject = camera;
+      await video.play();
+      if (opening === request) cameraStatus("");
+    } catch {
+      if (opening === request) {
+        releaseStream();
+        cameraStatus("الكاميرا ما فتحتش هنا. تقدر تصوّر بكاميرا التليفون.", true);
+      }
+    } finally {
+      if (opening === request) setBusy(false);
+    }
+  }
+
+  async function reviewCapture(file) {
+    if (busy || pending || !capturing) return;
+    const opening = request;
+    setBusy(true);
+    try {
+      const page = await preparePage(file);
+      if (opening !== request) {
+        releaseCanvas(page.preview);
+        return;
+      }
+      pending = page;
+      editCrop = !page.detected;
+      showPage();
+      $("editor").scrollIntoView({block:"start"});
+      if (!page.detected) notice("الحواف مش واضحة. ظبّط الزوايا قبل ما تقبل الصفحة.");
+    } catch {
+      if (opening === request) cameraStatus("الصورة ما اتفتحتش. جرّب تصوّر تاني.", !stream);
+    } finally {
+      if (opening === request) setBusy(false);
+    }
+  }
+
+  $("take").addEventListener("click", showCamera);
+  $("close-camera").addEventListener("click", stopCapture);
+  $("native-camera").addEventListener("click", () => $("camera").click());
+  $("camera").addEventListener("change", (event) => {
+    const file = event.target.files[0];
+    event.target.value = "";
+    if (file) void reviewCapture(file);
+  });
+  $("pick").addEventListener("click", () => $("library").click());
+  $("library").addEventListener("change", (event) => {
+    const files = Array.from(event.target.files);
+    event.target.value = "";
+    void add(files);
+  });
+  video.addEventListener("loadeddata", () => {
+    if (!busy) $("snap").disabled = !stream || video.readyState < 2;
+  });
+  $("snap").addEventListener("click", async () => {
+    if (busy || pending || !stream || video.readyState < 2) return;
+    const opening = request;
+    const scale = Math.min(1, 2500 / Math.max(video.videoWidth, video.videoHeight));
+    const canvas = makeCanvas(Math.max(1, Math.round(video.videoWidth * scale)),
+      Math.max(1, Math.round(video.videoHeight * scale)));
+    setBusy(true);
+    try {
+      canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+      const jpeg = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", .93));
+      if (opening !== request) return;
+      if (!jpeg) throw new Error("Capture failed");
+      setBusy(false);
+      await reviewCapture(new File([jpeg], "scan.jpg", {type:"image/jpeg"}));
+    } catch {
+      if (opening === request) cameraStatus("اللقطة ما اتاخدتش. جرّب تاني.");
+    } finally {
+      releaseCanvas(canvas);
+      if (opening === request) setBusy(false);
+    }
+  });
+
+  function resumeCapture() {
+    notice();
+    showPage();
+    $("capture-area").scrollIntoView({block:"start"});
+    if (stream) {
+      void video.play().catch(() => cameraStatus("الكاميرا وقفت. كمّل من كاميرا التليفون.", true));
+    } else {
+      $("camera").click();
+    }
+    setBusy(false);
+  }
+
+  function acceptCapture(next) {
+    if (busy || !pending) return;
+    pages.push(pending);
+    active = pages.length - 1;
+    pending = null;
     invalidate();
+    if (next && pages.length < MAX_PAGES) {
+      resumeCapture();
+    } else {
+      notice();
+      stopCapture();
+      $("export").scrollIntoView({block:"nearest"});
+    }
+  }
+
+  $("accept-next").addEventListener("click", () => acceptCapture(true));
+  $("accept-stop").addEventListener("click", () => acceptCapture(false));
+  $("retake").addEventListener("click", () => {
+    if (busy || !pending) return;
+    releaseCanvas(pending.preview);
+    pending = null;
+    resumeCapture();
+  });
+  $("toggle-crop").addEventListener("click", () => {
+    editCrop = !editCrop;
+    showPage();
+  });
+  window.addEventListener("pagehide", () => {
+    releaseStream();
+    request++;
+    if (!pending) capturing = false;
+  });
+  window.addEventListener("pageshow", (event) => {
+    if (!event.persisted) return;
+    if (pending) cameraStatus("كمّل من كاميرا التليفون.", true);
+    showPage();
+    setBusy(false);
+  });
+
+
+  function setQuad(points) {
+    currentPage().quad = points;
+    currentPage().detected = true;
+    cropHint();
+    if (!pending) invalidate();
     redraw();
   }
 
   $("auto").addEventListener("click", () => {
-    const found = detectOnCanvas(pages[active].preview);
+    const found = detectOnCanvas(currentPage().preview);
     if (found) setQuad(found);
     notice(found ? "" : "الحواف مش واضحة. اسحب الأربع زوايا عشان تحدّد الورقة.");
   });
@@ -483,7 +806,7 @@ function startScanner() {
     setQuad(fullFrame());
   });
   $("rotate").addEventListener("click", () => {
-    const page = pages[active];
+    const page = currentPage();
     const next = makeCanvas(page.preview.height, page.preview.width);
     const ctx = next.getContext("2d");
     ctx.translate(next.width, 0);
@@ -493,7 +816,7 @@ function startScanner() {
     page.preview = next;
     page.turns = (page.turns + 1) % 4;
     page.quad = [page.quad[3], ...page.quad.slice(0, 3)].map(([x,y]) => [1-y,x]);
-    invalidate();
+    if (!pending) invalidate();
     showPage();
   });
   $("remove").addEventListener("click", () => {
@@ -514,7 +837,7 @@ function startScanner() {
     if (busy || drag) return;
     const position = pointer(event);
     const rect = outline.getBoundingClientRect();
-    const distances = pages[active].quad.map(([x,y]) => Math.hypot((x-position[0])*rect.width,(y-position[1])*rect.height));
+    const distances = currentPage().quad.map(([x,y]) => Math.hypot((x-position[0])*rect.width,(y-position[1])*rect.height));
     const closest = Math.min(...distances);
     if (closest > 34) return;
     drag = {id: event.pointerId, index: distances.indexOf(closest)};
@@ -523,25 +846,28 @@ function startScanner() {
 
   outline.addEventListener("pointermove", (event) => {
     if (busy || !drag || drag.id !== event.pointerId) return;
-    const quad = pages[active].quad.slice();
+    const quad = currentPage().quad.slice();
     quad[drag.index] = pointer(event);
     if (validQuad(quad)) setQuad(quad);
   });
   outline.addEventListener("lostpointercapture", () => { drag = null; });
-  window.addEventListener("resize", () => { if (active >= 0) redraw(); });
+  window.addEventListener("resize", () => { if (currentPage() && !$("editor").hidden && !outline.hidden) redraw(); });
+
+  for (const input of qualityInputs) input.addEventListener("change", invalidate);
 
   $("filename").addEventListener("input", () => { if (output) $("download").download = filename(); });
 
   $("build").addEventListener("click", async () => {
-    if (busy || active < 0) return;
+    if (busy || active < 0 || pending || capturing) return;
     invalidate();
     setBusy(true);
     try {
       const images = [];
+      const qualityMode = qualityInputs.find(input => input.checked).value;
       let remaining = MAX_BYTES - 4096 - pages.length * 750;
       for (const page of pages) {
         notice("بنضغط صفحة " + formatter.format(images.length + 1) + " من " + formatter.format(pages.length) + "…");
-        const image = await compressPage(page, Math.floor(remaining / (pages.length - images.length)));
+        const image = await compressPage(page, Math.floor(remaining / (pages.length - images.length)), qualityMode);
         images.push(image);
         remaining -= image.jpeg.size;
       }

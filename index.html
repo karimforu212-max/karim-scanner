@@ -6,8 +6,8 @@
 <meta name="theme-color" content="#101b2e">
 <meta name="description" content="قص المستندات وحوّل الصور إلى PDF على الآيفون والكمبيوتر.">
 <title>Karim Scanner | كريم سكانر</title>
-<link rel="stylesheet" href="style.css">
-<script src="scanner.js" defer></script>
+<link rel="stylesheet" href="style.css?v=3">
+<script src="scanner.js?v=3" defer></script>
 </head>
 <body>
 <header class="top"><div class="wrap brand"><span class="brand-mark" aria-hidden="true"><i></i></span> <span dir="ltr">Karim Scanner</span></div></header>
@@ -16,7 +16,7 @@
   <h1>ورقك في ملف PDF</h1>
   <p>اختار الصور أو صوّر الورق بالموبايل. هنقص الزيادات ونضغط الصفحات في ملف PDF واحد.</p>
   <div class="actions">
-    <button type="button" id="take" class="primary"><span aria-hidden="true">◎</span> صوّر ورقة</button>
+    <button type="button" id="take" class="primary"><span aria-hidden="true">◎</span> افتح الكاميرا</button>
     <button type="button" id="pick" class="secondary">اختار صور</button>
   </div>
   <input hidden id="camera" type="file" accept="image/*" capture="environment">
@@ -24,10 +24,25 @@
 </section>
 
 <p id="notice" class="notice" role="status" hidden></p>
+<section class="panel" id="capture-area" hidden aria-labelledby="capture-title">
+  <div class="row">
+    <h2 id="capture-title">الكاميرا</h2>
+    <button type="button" class="subtle" id="close-camera">اقفل الكاميرا</button>
+  </div>
+  <p class="hint" id="capture-count"></p>
+  <video id="live" autoplay muted playsinline aria-label="معاينة الكاميرا"></video>
+  <button type="button" class="primary wide" id="snap" disabled>صوّر الصفحة</button>
+  <p id="camera-status" class="hint" role="status" hidden></p>
+  <button type="button" class="secondary wide" id="native-camera" hidden>استخدم كاميرا التليفون</button>
+</section>
 <section class="panel" id="editor" hidden aria-labelledby="edit-title">
   <div class="row">
     <h2 id="edit-title">حدود الورقة</h2>
     <button type="button" class="subtle" id="auto">قص تلقائي</button>
+  </div>
+  <div class="row review-title" id="review-heading" hidden>
+    <p class="hint" id="review-count"></p>
+    <button type="button" class="subtle" id="toggle-crop">ظبّط القص</button>
   </div>
   <div class="strip" id="pages" aria-label="اختيار الصفحة"></div>
   <div class="preview">
@@ -40,12 +55,22 @@
     <button type="button" class="subtle" id="rotate">لفّ ٩٠°</button>
     <button type="button" class="subtle remove" id="remove">احذف الصفحة</button>
   </div>
+  <div class="review-buttons" id="review-buttons" hidden>
+    <button type="button" class="primary wide" id="accept-next">اقبل وصوّر اللي بعدها</button>
+    <button type="button" class="secondary" id="accept-stop">اقبل وخلص التصوير</button>
+    <button type="button" class="subtle remove" id="retake">أعد التصوير</button>
+  </div>
 </section>
 
 <section class="panel export" id="export" hidden aria-labelledby="export-title">
   <h2 id="export-title">احفظ المستند</h2>
   <label for="filename">اسم الملف</label>
   <div class="name"><input id="filename" type="text" maxlength="90" enterkeyhint="done" autocomplete="off"><span dir="ltr">.pdf</span></div>
+  <fieldset class="quality">
+    <legend>جودة الـPDF</legend>
+    <label><input type="radio" name="quality" value="clear" checked> أوضح</label>
+    <label><input type="radio" name="quality" value="light"> أخف</label>
+  </fieldset>
   <button type="button" id="build" class="primary wide">جهّز PDF</button>
   <div id="result" hidden>
     <p id="size" class="size"></p>
